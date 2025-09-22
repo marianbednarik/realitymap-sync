@@ -1,0 +1,115 @@
+name: Fetch Bratislava Properties
+
+on:
+  schedule:
+    - cron: '0 */8 * * *' # UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-bratislava
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch sale and rent datasets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p data etag
+
+          # Ensure jq is available for JSON validation
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y -qq
+            sudo apt-get install -y -qq jq
+          fi
+
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:142.0) Gecko/20100101 Firefox/142.0'
+
+          fetch_dataset() {
+            local name="$1" url="$2"
+            local data_path="data/${name}.json"
+            local etag_path="etag/${name}.txt"
+
+            local tmp_headers
+            tmp_headers=$(mktemp)
+            local tmp_json
+            tmp_json=$(mktemp)
+
+            local header_args=()
+            if [[ -f "${etag_path}" ]]; then
+              local old_etag
+              old_etag=$(<"${etag_path}") || true
+              if [[ -n "${old_etag}" ]]; then
+                header_args+=(-H "If-None-Match: ${old_etag}")
+              fi
+            fi
+
+            echo "[${name}] Fetching..."
+            curl -sS --fail-with-body --compressed -L \
+              --retry 3 --retry-delay 5 --retry-connrefused \
+              -D "${tmp_headers}" -o "${tmp_json}" \
+              -H "User-Agent: ${UA}" \
+              "${header_args[@]}" \
+              "${url}"
+
+            local status
+            status=$(awk 'NR==1{print $2}' "${tmp_headers}" || true)
+
+            if [[ "${status}" == "304" ]]; then
+              echo "[${name}] 304 Not Modified"
+              rm -f "${tmp_headers}" "${tmp_json}"
+              return 0
+            fi
+
+            if [[ "${status}" != "200" ]]; then
+              echo "[${name}] Unexpected HTTP status: ${status:-<empty>}"
+              echo "Response headers:"
+              cat "${tmp_headers}" || true
+              exit 1
+            fi
+
+            # Validate JSON and write atomically
+            jq -e . "${tmp_json}" > "${data_path}.tmp"
+            mv -f "${data_path}.tmp" "${data_path}"
+
+            # Extract and save new ETag if present
+            local new_etag
+            new_etag=$(awk 'BEGIN{IGNORECASE=1}/^etag:/{sub(/^etag:[ \t]*/,"");print;exit}' "${tmp_headers}" | tr -d "\r")
+            if [[ -n "${new_etag}" ]]; then
+              printf '%s\n' "${new_etag}" > "${etag_path}"
+            else
+              echo "[${name}] No ETag header present; keeping existing if any."
+            fi
+
+            rm -f "${tmp_headers}" "${tmp_json}"
+          }
+
+          # Fetch datasets
+          fetch_dataset "bratislava-sale" 'https://realitymap.sk/ads?district=Bratislava&dealType=predaj'
+          fetch_dataset "bratislava-rent" 'https://realitymap.sk/ads?district=Bratislava&dealType=pren%C3%A1jom'
+
+          # Configure git locally
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Stage changes (only changed files will be staged)
+          git add -A data etag
+
+          # Commit only if there are staged changes
+          if git diff --cached --quiet -- data etag; then
+            echo 'No changes to commit.'
+            exit 0
+          fi
+
+          git commit -m "Update Bratislava properties data @ $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push
